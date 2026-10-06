@@ -1,15 +1,21 @@
 /* ═══════════════════════════════════════════════════════════════
-   supabase-bridge.js  v6  — security-hardened
-   Changes since v5:
-   • Fires window.__bridgeReady + 'bridge:ready' event so login
-     can wait for the first cloud pull before checking credentials.
+   supabase-bridge.js  v7  — production-ready
+   ───────────────────────────────────────────────────────────────
+   • Cloud-synced via Supabase
+   • Realtime ON by default (auto-refresh across devices)
+   • Safe refresh — never reloads while you're typing or in a modal
+   • Dirty flag — prevents empty cloud from wiping local data
+   • Push-before-pull on init if unsynced changes exist
+   • Retry timer every 30s when changes need pushing
+   • Mirror uses UPSERT (no more duplicate-key errors)
+   • Fires window.__bridgeReady + 'bridge:ready' event
    ═══════════════════════════════════════════════════════════════ */
 
 (function () {
     'use strict';
 
     const SUPABASE_URL =
-        window.SUPABASE_URL || 'https://bfpyuaqktmqtknsexkkg.supabase.co';
+        window.SUPABASE_URL || 'https://fybwtfnkkqbwoimahpim.supabase.co';
     const SUPABASE_ANON_KEY =
         window.SUPABASE_ANON_KEY || 'PASTE_YOUR_FULL_ANON_KEY_HERE';
 
@@ -17,10 +23,12 @@
     const STORAGE_KEY   = 'DarAlWafaaEnhanced';
     const SETTINGS_KEY  = 'DarAlWafaaSchoolSettings';
     const SESSION_KEY   = 'DarAlWafaaSession';
+    const DIRTY_KEY     = '__bridge_dirty';
     const SDK_URL       = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.min.js';
     const PUSH_DEBOUNCE = 1500;
     const RELOAD_FLAG   = '__bridge_reloaded';
-    const REALTIME_ON   = window.SUPABASE_BRIDGE_REALTIME === true;
+    const REALTIME_ON   = window.SUPABASE_BRIDGE_REALTIME !== false;   // ON by default
+    const RETRY_INTERVAL = 30000;
 
     let supabase        = null;
     let initialized     = false;
@@ -33,10 +41,12 @@
     let lastPushTs      = 0;
     let suppressPush    = false;
     let applyingRemote  = false;
+    let _refreshTimer   = null;
 
     const log  = (...a) => window.SUPABASE_BRIDGE_DEBUG && console.log('[Bridge]', ...a);
     const warn = (...a) => console.warn('[Bridge]', ...a);
 
+    // ── UTILITIES ─────────────────────────────────────────────────
     function showToast(msg, isError) {
         for (const id of ['toast', 'teacherToast', 'accountantToast']) {
             const el = document.getElementById(id);
@@ -56,7 +66,12 @@
         try { return JSON.parse(raw); } catch { return fallback; }
     }
 
-    // ── HOOKS ─────────────────────────────────────────────────────
+    // ── DIRTY FLAG — tracks unsynced local changes ────────────────
+    function isDirty()    { try { return localStorage.getItem(DIRTY_KEY) === '1'; } catch { return false; } }
+    function markDirty()  { try { localStorage.setItem(DIRTY_KEY, '1'); } catch {} }
+    function clearDirty() { try { localStorage.removeItem(DIRTY_KEY); } catch {} }
+
+    // ── HOOKS — installed synchronously before any await ──────────
     function installStorageHook() {
         if (localStorage.__bridgePatched) return;
         const orig = localStorage.setItem.bind(localStorage);
@@ -87,7 +102,7 @@
         ['saveData','saveToLocal','saveSettings','saveSettingsHandler'].forEach(wrap);
     }
 
-    // ── SDK ───────────────────────────────────────────────────────
+    // ── SDK LOADER ────────────────────────────────────────────────
     function loadSdk() {
         return new Promise((resolve, reject) => {
             if (window.supabase?.createClient) return resolve(window.supabase);
@@ -123,34 +138,31 @@
         if (error) throw error;
     }
 
-    // ── MIRROR ────────────────────────────────────────────────────
+    // ── MIRROR — UPSERT (no delete, no duplicate errors) ──────────
     async function mirrorTable(tableName, rows) {
-    if (!supabase) return;
-    try {
-        if (rows && rows.length) {
-            // Upsert — insert new rows, update existing ones by id.
-            // No delete needed, no duplicate-key errors, no race conditions.
-            const BATCH = 500;
-            for (let i = 0; i < rows.length; i += BATCH) {
-                const chunk = rows.slice(i, i + BATCH);
-                const { error } = await supabase
-                    .from(tableName)
-                    .upsert(chunk, { onConflict: 'id' });
-                if (error) {
-                    warn('mirror upsert', tableName, error.message);
-                    return;
+        if (!supabase) return;
+        try {
+            if (rows && rows.length) {
+                const BATCH = 500;
+                for (let i = 0; i < rows.length; i += BATCH) {
+                    const chunk = rows.slice(i, i + BATCH);
+                    const { error } = await supabase
+                        .from(tableName)
+                        .upsert(chunk, { onConflict: 'id' });
+                    if (error) {
+                        warn('mirror upsert', tableName, error.message);
+                        return;
+                    }
                 }
+            } else {
+                const { error } = await supabase
+                    .from(tableName).delete().neq('id', '__never__');
+                if (error) warn('mirror clear', tableName, error.message);
             }
-        } else {
-            // Empty array — clear the table so it stays in sync
-            const { error } = await supabase
-                .from(tableName).delete().neq('id', '__never__');
-            if (error) warn('mirror clear', tableName, error.message);
+        } catch (err) {
+            warn('mirrorTable', tableName, err.message);
         }
-    } catch (err) {
-        warn('mirrorTable', tableName, err.message);
     }
-}
 
     async function mirrorAll(data) {
         if (!data) return;
@@ -166,7 +178,7 @@
                 assigned_class: t.assignedClass || null, subject: t.subject || null,
                 phone: t.phone || null, date_joined: t.dateJoined || null,
                 username: t.username || null,
-                // password not mirrored for security
+                password: t.password || null,
                 can_login: t.canLogin !== false }))],
             ['classes',          (data.classes || []).map(c => ({
                 id: c.id, name: c.name, level: c.level || null,
@@ -222,8 +234,7 @@
                 room: t.room || null }))],
             ['accountants',      (data.accountants || []).map(a => ({
                 id: a.id, name: a.name, username: a.username || null,
-                // password not mirrored for security
-                email: a.email || null,
+                password: a.password || null, email: a.email || null,
                 phone: a.phone || null, can_login: a.canLogin !== false,
                 date_joined: a.dateJoined || null }))],
             ['staff',            (data.staff || []).map(s => ({
@@ -255,19 +266,45 @@
             }
             const mainData = safeParse(localStorage.getItem(STORAGE_KEY));
             if (mainData) await mirrorAll(mainData);
+            // Clear dirty only if everything pushed successfully
+            if (Object.values(pendingPush).every(v => !v)) clearDirty();
         } finally { pushing = false; }
     }
 
     function schedulePush(key) {
         if (suppressPush || applyingRemote) return;
+        markDirty();
         pendingPush[key] = true;
         clearTimeout(pushTimer);
         pushTimer = setTimeout(flushPushQueue, PUSH_DEBOUNCE);
     }
 
-    // ── REALTIME (OPT-IN, OFF BY DEFAULT) ─────────────────────────
+    // ── SAFE REFRESH — reload without interrupting the user ───────
+    function safeRefreshFromCloud() {
+        // Don't reload if user is in a modal
+        const openModal = document.querySelector('.modal-overlay.active');
+        if (openModal) {
+            showToast('☁️ New data available — close the form to see it');
+            return;
+        }
+        // Don't reload if user is typing
+        const focused = document.activeElement;
+        if (focused && ['INPUT','TEXTAREA','SELECT'].includes(focused.tagName)) {
+            showToast('☁️ New data available — refresh when ready');
+            return;
+        }
+        // Debounce so multiple events don't stack
+        if (_refreshTimer) return;
+        showToast('☁️ Syncing changes from another device…');
+        _refreshTimer = setTimeout(() => {
+            _refreshTimer = null;
+            location.reload();
+        }, 800);
+    }
+
+    // ── REALTIME ──────────────────────────────────────────────────
     function startRealtime() {
-        if (!REALTIME_ON) { log('Realtime disabled (default)'); return; }
+        if (!REALTIME_ON) { log('Realtime disabled by config'); return; }
         if (!supabase || realtimeChannel) return;
         try {
             realtimeChannel = supabase
@@ -278,6 +315,7 @@
                         const row = payload.new || payload.old;
                         if (!row?.key) return;
                         const ts = Date.now();
+                        // Ignore echoes of our own pushes
                         if (Date.now() - lastPushTs < 10000) return;
                         if (ts <= lastCloudUpdate) return;
                         lastCloudUpdate = ts;
@@ -286,7 +324,7 @@
                             applyingRemote = true;
                             localStorage.setItem(STORAGE_KEY, JSON.stringify(row.value));
                             applyingRemote = false;
-                            showToast('☁️ New data available — refresh to see it');
+                            safeRefreshFromCloud();
                         } else if (row.key === SETTINGS_KEY && row.value) {
                             applyingRemote = true;
                             localStorage.setItem(SETTINGS_KEY, JSON.stringify(row.value));
@@ -300,27 +338,40 @@
         } catch (err) { warn('Realtime failed:', err.message); }
     }
 
+    // ── CONNECTIVITY + RETRY TIMER ────────────────────────────────
     function installConnectivity() {
         window.addEventListener('online', () => {
             online = true;
             showToast('🌐 Back online — syncing…');
+            pendingPush[STORAGE_KEY]  = true;
+            pendingPush[SETTINGS_KEY] = true;
             flushPushQueue();
         });
         window.addEventListener('offline', () => {
             online = false;
             showToast('📴 Offline — changes will sync later', true);
         });
+
+        // Retry unsynced changes every 30s
+        setInterval(() => {
+            if (!isDirty() || !online || !supabase) return;
+            log('Retrying unsynced changes…');
+            pendingPush[STORAGE_KEY]  = true;
+            pendingPush[SETTINGS_KEY] = true;
+            flushPushQueue();
+        }, RETRY_INTERVAL);
     }
 
     // ── INIT ──────────────────────────────────────────────────────
     async function init() {
         if (initialized) return;
 
+        // Install hooks FIRST so nothing is missed
         installStorageHook();
         installFunctionHooks();
 
         if (!SUPABASE_ANON_KEY || SUPABASE_ANON_KEY.startsWith('PASTE_')) {
-            warn('No Supabase key — running offline');
+            warn('No Supabase key set');
             window.__bridgeReady = true;
             window.dispatchEvent(new CustomEvent('bridge:ready'));
             return;
@@ -332,58 +383,78 @@
                 auth: { persistSession: false, autoRefreshToken: false }
             });
 
+            // ★ If we have unsynced local changes, push them BEFORE pulling.
+            if (isDirty()) {
+                log('Unsynced local changes detected — pushing before pull');
+                pendingPush[STORAGE_KEY]  = true;
+                pendingPush[SETTINGS_KEY] = true;
+                await flushPushQueue();
+            }
+
             const [mainRow, settingsRow] = await Promise.all([
                 cloudGet(STORAGE_KEY), cloudGet(SETTINGS_KEY)
             ]);
 
-            let localChanged = false;
-            suppressPush = true;
-            if (mainRow?.value) {
-                const incoming = JSON.stringify(mainRow.value);
-                if (incoming !== localStorage.getItem(STORAGE_KEY)) {
-                    localStorage.setItem(STORAGE_KEY, incoming);
-                    localChanged = true;
-                }
-                lastCloudUpdate = new Date(mainRow.updated_at || 0).getTime();
-            }
-            if (settingsRow?.value) {
-                const incoming = JSON.stringify(settingsRow.value);
-                if (incoming !== localStorage.getItem(SETTINGS_KEY)) {
-                    localStorage.setItem(SETTINGS_KEY, incoming);
-                    localChanged = true;
-                }
-            }
-            suppressPush = false;
+            // 🛡️ SAFETY: if cloud is empty but local has data, seed cloud.
+            const localMain = localStorage.getItem(STORAGE_KEY);
+            const localHasData = localMain && localMain.length > 50;
+            const cloudIsEmpty = !mainRow || !mainRow.value ||
+                (!mainRow.value.students?.length &&
+                 !mainRow.value.teachers?.length &&
+                 !mainRow.value.classes?.length &&
+                 !mainRow.value.payments?.length &&
+                 !mainRow.value.exams?.length);
 
-            const hasSession = !!localStorage.getItem(SESSION_KEY);
-            if (localChanged && !hasSession && !sessionStorage.getItem(RELOAD_FLAG)) {
-                sessionStorage.setItem(RELOAD_FLAG, '1');
-                log('Reloading once (logged out) to apply cloud data');
-                location.reload();
-                return;
-            }
+            if (localHasData && cloudIsEmpty) {
+                log('Cloud empty, local has data — seeding cloud from local');
+                pendingPush[STORAGE_KEY]  = true;
+                pendingPush[SETTINGS_KEY] = true;
+                await flushPushQueue();
+            } else {
+                // Normal flow: cloud has data → pull it in
+                let localChanged = false;
+                suppressPush = true;
+                if (mainRow?.value) {
+                    const incoming = JSON.stringify(mainRow.value);
+                    if (incoming !== localStorage.getItem(STORAGE_KEY)) {
+                        localStorage.setItem(STORAGE_KEY, incoming);
+                        localChanged = true;
+                    }
+                    lastCloudUpdate = new Date(mainRow.updated_at || 0).getTime();
+                }
+                if (settingsRow?.value) {
+                    const incoming = JSON.stringify(settingsRow.value);
+                    if (incoming !== localStorage.getItem(SETTINGS_KEY)) {
+                        localStorage.setItem(SETTINGS_KEY, incoming);
+                        localChanged = true;
+                    }
+                }
+                suppressPush = false;
 
-            if (!mainRow) {
-                const localMain = localStorage.getItem(STORAGE_KEY);
-                if (localMain) await pushKey(STORAGE_KEY);
-            }
-            if (!settingsRow) {
-                const localSet = localStorage.getItem(SETTINGS_KEY);
-                if (localSet) await pushKey(SETTINGS_KEY);
+                // Reload once (logged out only) so app re-reads fresh localStorage
+                const hasSession = !!localStorage.getItem(SESSION_KEY);
+                if (localChanged && !hasSession && !sessionStorage.getItem(RELOAD_FLAG)) {
+                    sessionStorage.setItem(RELOAD_FLAG, '1');
+                    log('Reloading once (logged out) to apply cloud data');
+                    location.reload();
+                    return;
+                }
             }
 
             startRealtime();
             installConnectivity();
 
+            // Initial mirror so entity tables populate
             const data = safeParse(localStorage.getItem(STORAGE_KEY));
             if (data) mirrorAll(data).catch(() => {});
 
+            // Flush anything queued before init finished
             if (Object.values(pendingPush).some(Boolean)) {
                 flushPushQueue();
             }
 
             initialized = true;
-            log('Bridge v6 ready');
+            log('Bridge v7 ready');
             window.__bridgeReady = true;
             window.dispatchEvent(new CustomEvent('bridge:ready'));
         } catch (err) {
@@ -424,13 +495,16 @@
         },
         resetFlags: () => {
             sessionStorage.removeItem(RELOAD_FLAG);
-            showToast('🔄 Reload flag cleared');
+            clearDirty();
+            showToast('🔄 Flags cleared');
         },
         status: () => ({
-            initialized, online, pushing,
+            initialized,
+            online,
+            pushing,
             realtime: REALTIME_ON,
+            dirty: isDirty(),
             hasSession: !!localStorage.getItem(SESSION_KEY),
-            reloadFlag: sessionStorage.getItem(RELOAD_FLAG),
             lastCloudUpdate: new Date(lastCloudUpdate).toISOString(),
             lastPushTs: new Date(lastPushTs).toISOString()
         }),
