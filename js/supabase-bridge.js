@@ -125,20 +125,32 @@
 
     // ── MIRROR ────────────────────────────────────────────────────
     async function mirrorTable(tableName, rows) {
-        if (!supabase) return;
-        try {
-            const { error: delErr } = await supabase
-                .from(tableName).delete().neq('id', '__never__');
-            if (delErr) { warn('mirror wipe', tableName, delErr.message); return; }
-            if (!rows || !rows.length) return;
+    if (!supabase) return;
+    try {
+        if (rows && rows.length) {
+            // Upsert — insert new rows, update existing ones by id.
+            // No delete needed, no duplicate-key errors, no race conditions.
             const BATCH = 500;
             for (let i = 0; i < rows.length; i += BATCH) {
                 const chunk = rows.slice(i, i + BATCH);
-                const { error } = await supabase.from(tableName).insert(chunk);
-                if (error) { warn('mirror insert', tableName, error.message); return; }
+                const { error } = await supabase
+                    .from(tableName)
+                    .upsert(chunk, { onConflict: 'id' });
+                if (error) {
+                    warn('mirror upsert', tableName, error.message);
+                    return;
+                }
             }
-        } catch (err) { warn('mirrorTable', tableName, err.message); }
+        } else {
+            // Empty array — clear the table so it stays in sync
+            const { error } = await supabase
+                .from(tableName).delete().neq('id', '__never__');
+            if (error) warn('mirror clear', tableName, error.message);
+        }
+    } catch (err) {
+        warn('mirrorTable', tableName, err.message);
     }
+}
 
     async function mirrorAll(data) {
         if (!data) return;
